@@ -61,7 +61,6 @@ KNOWN_SSH_HOSTS = {
     "macmini": {"host": "192.168.1.93", "user": "davevoyles"},
     "macbook-personal": {"host": "192.168.1.2", "user": "davevoyles"},
     "macbook-dock": {"host": "192.168.1.39", "user": "davevoyles"},
-    "macbook": {"host": "Daves-MacBook-Pro-2.local", "user": "davevoyles"},
     "desktop": {"host": "192.168.1.24", "user": "DaveV"},
 }
 
