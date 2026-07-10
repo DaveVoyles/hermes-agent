@@ -259,9 +259,9 @@ _TOOL_STUBS = {
     ),
     "terminal": (
         "terminal",
-        "command: str, timeout: int = None, workdir: str = None",
-        '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}',
+        "command: str, timeout: int = None, workdir: str = None, host: str = None",
+        '"""Run a shell command (foreground only). host: optional known SSH alias to run on a remote machine instead of locally. Returns dict with "output" and "exit_code"."""',
+        '{"command": command, "timeout": timeout, "workdir": workdir, "host": host}',
     ),
 }
 

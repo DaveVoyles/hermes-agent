@@ -51,6 +51,22 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Known SSH hosts allowlist for per-call SSH host targeting.
+# Sourced from ~/.ssh/config (2026-07-10, Dave's explicit direction) — per
+# the authoritative-source rule in MainVault's home_lab_connections.md, if
+# this ever disagrees with the live ~/.ssh/config, the ssh config wins;
+# update this dict to match it, not the reverse.
+# ---------------------------------------------------------------------------
+KNOWN_SSH_HOSTS = {
+    "macmini": {"host": "192.168.1.93", "user": "davevoyles"},
+    "macbook-personal": {"host": "192.168.1.2", "user": "davevoyles"},
+    "macbook-dock": {"host": "192.168.1.39", "user": "davevoyles"},
+    "macbook": {"host": "Daves-MacBook-Pro-2.local", "user": "davevoyles"},
+    "desktop": {"host": "192.168.1.24", "user": "DaveV"},
+}
+
+
+# ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
 # The terminal tool polls this during command execution so it can kill
 # long-running subprocesses immediately instead of blocking until timeout.
@@ -2016,6 +2032,7 @@ def terminal_tool(
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
+    host: Optional[str] = None,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
@@ -2031,6 +2048,7 @@ def terminal_tool(
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
+        host: Optional SSH host alias from KNOWN_SSH_HOSTS. When provided, forces SSH execution to that host for this call only, overriding session TERMINAL_ENV.
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
@@ -2046,7 +2064,10 @@ def terminal_tool(
 
         # With custom timeout
         >>> result = terminal_tool(command="long_task.sh", timeout=300)
-        
+
+        # Run on a specific SSH host
+        >>> result = terminal_tool(command="whoami", host="macmini")
+
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
@@ -2067,11 +2088,29 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # Validate and handle per-call SSH host override
+        resolved_host = None
+        if host:
+            if host not in KNOWN_SSH_HOSTS:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": f"Unknown SSH host alias '{host}'. Known aliases: {', '.join(sorted(KNOWN_SSH_HOSTS.keys()))}",
+                    "status": "error",
+                }, ensure_ascii=False)
+            # Per-call override: force SSH for this call
+            resolved_host = KNOWN_SSH_HOSTS[host]
+            env_type = "ssh"
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+
+        # Build cache key incorporating host when present to prevent collisions
+        # between calls with different hosts in the same task
+        cache_key = effective_task_id if not host else f"{effective_task_id}::ssh::{host}"
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -2147,15 +2186,17 @@ def terminal_tool(
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
         with _env_lock:
-            # Prefer the collapsed container id, but fall back to an env cached
-            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
-            # with a CWD-only override collapse to "default" for container
-            # sharing, yet an env may already be cached under the originating
-            # task_id; honor it instead of spawning a duplicate.
-            _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
-            )
+            # When host is provided, only use the host-specific cache key.
+            # Otherwise, prefer the effective_task_id but fall back to raw task_id
+            # for backwards compatibility with existing environments.
+            if host:
+                _existing_key = cache_key if cache_key in _active_environments else None
+            else:
+                _existing_key = (
+                    cache_key if cache_key in _active_environments
+                    else (effective_task_id if effective_task_id in _active_environments
+                          else (task_id if task_id and task_id in _active_environments else None))
+                )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
                 env = _active_environments[_existing_key]
@@ -2166,17 +2207,21 @@ def terminal_tool(
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if cache_key not in _creation_locks:
+                    _creation_locks[cache_key] = threading.Lock()
+                task_lock = _creation_locks[cache_key]
 
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
-                    _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
-                    )
+                    if host:
+                        _existing_key = cache_key if cache_key in _active_environments else None
+                    else:
+                        _existing_key = (
+                            cache_key if cache_key in _active_environments
+                            else (effective_task_id if effective_task_id in _active_environments
+                                  else (task_id if task_id and task_id in _active_environments else None))
+                        )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
                         env = _active_environments[_existing_key]
@@ -2185,17 +2230,29 @@ def terminal_tool(
                 if needs_creation:
                     if env_type == "singularity":
                         _check_disk_usage_warning()
-                    logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
+                    host_label = f" (host={host})" if host else ""
+                    logger.info("Creating new %s environment for task %s%s...", env_type, effective_task_id[:8], host_label)
                     try:
                         ssh_config = None
                         if env_type == "ssh":
-                            ssh_config = {
-                                "host": config.get("ssh_host", ""),
-                                "user": config.get("ssh_user", ""),
-                                "port": config.get("ssh_port", 22),
-                                "key": config.get("ssh_key", ""),
-                                "persistent": config.get("ssh_persistent", False),
-                            }
+                            # Use resolved_host if provided (per-call override),
+                            # otherwise fall back to session config
+                            if resolved_host:
+                                ssh_config = {
+                                    "host": resolved_host.get("host", ""),
+                                    "user": resolved_host.get("user", ""),
+                                    "port": resolved_host.get("port", 22),
+                                    "key": resolved_host.get("key", ""),
+                                    "persistent": resolved_host.get("persistent", False),
+                                }
+                            else:
+                                ssh_config = {
+                                    "host": config.get("ssh_host", ""),
+                                    "user": config.get("ssh_user", ""),
+                                    "port": config.get("ssh_port", 22),
+                                    "key": config.get("ssh_key", ""),
+                                    "persistent": config.get("ssh_persistent", False),
+                                }
 
                         container_config = None
                         if env_type in {"docker", "singularity", "modal", "daytona"}:
@@ -2242,10 +2299,10 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _active_environments[cache_key] = new_env
+                        _last_activity[cache_key] = time.time()
                         env = new_env
-                    logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+                    logger.info("%s environment ready for task %s%s", env_type, effective_task_id[:8], host_label)
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -2742,6 +2799,8 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            if host:
+                result_dict["host"] = host
             try:
                 from agent.verification_evidence import record_terminal_result
 
@@ -2969,6 +3028,10 @@ TERMINAL_SCHEMA = {
                 "type": "string",
                 "description": "The command to execute on the VM"
             },
+            "host": {
+                "type": "string",
+                "description": f"Optional SSH host alias to target for this call. Empty/omitted means run locally (or per session default TERMINAL_ENV). Non-empty must be a known SSH alias: {', '.join(sorted(KNOWN_SSH_HOSTS.keys()))}. Unknown aliases are rejected. When set, this call runs over SSH to that host regardless of session TERMINAL_ENV.",
+            },
             "background": {
                 "type": "boolean",
                 "description": "Run the command in the background. Almost always pair with notify_on_complete=true — without it, the process runs silently and you'll have no way to learn it finished short of calling process(action='poll') yourself (easy to forget, leading to silent blindness on long jobs). Two legitimate patterns: (1) Long-lived processes that never exit (servers, watchers, daemons) — these stay silent because there's no exit to notify on. (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — these MUST set notify_on_complete=true. For short commands, prefer foreground with a generous timeout instead.",
@@ -3007,6 +3070,7 @@ TERMINAL_SCHEMA = {
 def _handle_terminal(args, **kw):
     return terminal_tool(
         command=args.get("command"),
+        host=args.get("host"),
         background=args.get("background", False),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
