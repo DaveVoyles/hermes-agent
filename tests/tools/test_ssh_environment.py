@@ -67,6 +67,75 @@ class TestBuildSSHCommand:
         assert env._build_ssh_command()[-1] == "u@h"
 
 
+class TestRunBashQuoting:
+    """Regression coverage for the desktop (Windows) quoting bug.
+
+    ssh joins trailing argv elements with spaces and sends the joined string
+    for the remote side to re-parse. A POSIX login shell strips
+    shlex.quote()'s quotes correctly, so `bash -c <shlex.quote(cmd)>` keeps
+    cmd_string as one argument. A Windows OpenSSH host's re-parse does not
+    preserve that quoting, so any command-line-embedded script (not just
+    trivial one-liners) arrives mangled — so Windows hosts instead send the
+    script over the SSH stdin channel (`bash -s`), sidestepping the remote
+    command-line re-parse entirely.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_connection(self, monkeypatch):
+        monkeypatch.setattr("tools.environments.ssh.subprocess.run",
+                            lambda *a, **k: subprocess.CompletedProcess([], 0))
+        monkeypatch.setattr("tools.environments.base.time.sleep", lambda _: None)
+
+    def _captured_call(self, env, cmd_string, monkeypatch, **kwargs):
+        captured = {}
+
+        def fake_popen_bash(cmd, stdin_data):
+            captured["cmd"] = cmd
+            captured["stdin_data"] = stdin_data
+            return MagicMock()
+
+        monkeypatch.setattr("tools.environments.ssh._popen_bash", fake_popen_bash)
+        env._run_bash(cmd_string, **kwargs)
+        return captured
+
+    def test_posix_host_quotes_compound_command(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")  # default remote_shell="posix"
+        captured = self._captured_call(env, "hostname && whoami", monkeypatch)
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("-c") + 1] == "'hostname && whoami'"
+
+    def test_posix_host_quotes_simple_command_when_needed(self, monkeypatch):
+        # shlex.quote leaves safe single words unquoted either way, so use
+        # a command with a space to actually exercise the quoting branch.
+        env = SSHEnvironment(host="h", user="u")
+        captured = self._captured_call(env, "echo hello world", monkeypatch, login=True)
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("-c") + 1] == "'echo hello world'"
+
+    def test_windows_host_sends_script_via_stdin_not_command_line(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u", remote_shell="windows")
+        cmd_string = "echo hello && echo world"
+        captured = self._captured_call(env, cmd_string, monkeypatch)
+        cmd = captured["cmd"]
+        # No -c, no embedded script text anywhere in the argv — only "-s".
+        assert "-c" not in cmd
+        assert "-s" in cmd
+        assert cmd_string not in cmd
+        assert captured["stdin_data"].startswith(cmd_string + "\n")
+
+    def test_windows_host_login_flag_with_stdin_script(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u", remote_shell="windows")
+        captured = self._captured_call(env, "whoami", monkeypatch, login=True)
+        cmd = captured["cmd"]
+        bash_idx = cmd.index("bash")
+        assert cmd[bash_idx:bash_idx + 3] == ["bash", "-l", "-s"]
+
+    def test_windows_host_appends_real_stdin_after_script(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u", remote_shell="windows")
+        captured = self._captured_call(env, "cat", monkeypatch, stdin_data="payload\n")
+        assert captured["stdin_data"] == "cat\npayload\n"
+
+
 class TestControlSocketPath:
     """Regression tests for issue #11840.
 

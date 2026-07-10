@@ -43,12 +43,20 @@ class SSHEnvironment(BaseEnvironment):
     """
 
     def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+                 timeout: int = 60, port: int = 22, key_path: str = "",
+                 remote_shell: str = "posix"):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
+        # "posix": ssh's remote-side re-parse of the joined command line goes
+        # through the user's POSIX login shell, which strips shlex.quote()'s
+        # single-quotes correctly. "windows": the remote re-parse doesn't
+        # preserve POSIX quoting, so shlex.quote() arrives mangled — pass the
+        # command unquoted instead. Verified empirically against both a POSIX
+        # host and a Windows OpenSSH host on 2026-07-10.
+        self.remote_shell = remote_shell
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
@@ -343,8 +351,29 @@ class SSHEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
-        """Spawn an SSH process that runs bash on the remote host."""
+        """Spawn an SSH process that runs bash on the remote host.
+
+        ssh joins the trailing argv elements with spaces and sends that as
+        one string for the remote side to re-parse. A POSIX login shell
+        strips shlex.quote()'s single-quotes correctly, so quoting via
+        `bash -c <shlex.quote(cmd_string)>` keeps cmd_string as one argument.
+
+        A Windows OpenSSH host's re-parse does not preserve that quoting the
+        same way — any command-line-embedded script (quotes, newlines,
+        wrapper markers) arrives mangled, not just simple one-liners. So for
+        `self.remote_shell == "windows"`, cmd_string is sent over the SSH
+        stdin channel instead of the command line (`bash -s`, script read
+        from stdin) — this sidesteps the remote-side re-parse entirely.
+        Real stdin_data (if any) is appended after the script, matching how
+        `some_script | bash` lets the script's own commands keep reading
+        stdin once the script text is consumed.
+        """
         cmd = self._build_ssh_command()
+        if self.remote_shell == "windows":
+            cmd.extend(["bash", "-l", "-s"] if login else ["bash", "-s"])
+            combined_stdin = cmd_string + "\n" + (stdin_data or "")
+            return _popen_bash(cmd, combined_stdin)
+
         if login:
             cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
         else:
