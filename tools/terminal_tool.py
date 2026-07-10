@@ -62,7 +62,10 @@ KNOWN_SSH_HOSTS = {
     "macbook-personal": {"host": "192.168.1.2", "user": "davevoyles"},
     "macbook-dock": {"host": "192.168.1.39", "user": "davevoyles"},
     "macbook": {"host": "Daves-MacBook-Pro-2.local", "user": "davevoyles"},
-    "desktop": {"host": "192.168.1.24", "user": "DaveV"},
+    # remote_shell="windows": ssh's remote-side re-parse of the joined command
+    # line strips single-quotes differently than a POSIX login shell does, so
+    # shlex.quote()'d args arrive mangled. See SSHEnvironment._run_bash.
+    "desktop": {"host": "192.168.1.24", "user": "DaveV", "remote_shell": "windows"},
 }
 
 
@@ -1544,6 +1547,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             user=ssh_config["user"],
             port=ssh_config.get("port", 22),
             key_path=ssh_config.get("key", ""),
+            remote_shell=ssh_config.get("remote_shell", "posix"),
             cwd=cwd,
             timeout=timeout,
         )
@@ -2244,6 +2248,7 @@ def terminal_tool(
                                     "port": resolved_host.get("port", 22),
                                     "key": resolved_host.get("key", ""),
                                     "persistent": resolved_host.get("persistent", False),
+                                    "remote_shell": resolved_host.get("remote_shell", "posix"),
                                 }
                             else:
                                 ssh_config = {
