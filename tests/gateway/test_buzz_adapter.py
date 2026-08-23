@@ -301,6 +301,30 @@ class TestMentionGating:
         assert Path(media_urls[0]).read_bytes() == payload
         assert Path(media_urls[0]).stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.asyncio
+    async def test_dispatch_message_forwards_media_urls(self):
+        adapter = _make_adapter()
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter._message_handler = object()
+        adapter.handle_message = capture
+        await adapter._dispatch_message(
+            text="see this",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Owner",
+            message_id="e-media",
+            created_at=100,
+            media_urls=["/tmp/vision.png"],
+        )
+        assert len(captured) == 1
+        assert captured[0].media_urls == ["/tmp/vision.png"]
+        assert captured[0].message_type == _buzz_mod.MessageType.PHOTO
+
     def test_imeta_parser_rejects_untrusted_hash_size_and_type(self):
         event = _event("e1")
         event["tags"] = [

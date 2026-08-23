@@ -1328,6 +1328,7 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        media_urls: Optional[List[str]] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1341,12 +1342,14 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=user_name,
         )
 
+        urls = [u for u in (media_urls or []) if u]
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if urls else MessageType.TEXT,
             source=source,
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+            media_urls=urls,
         )
 
         await self.handle_message(event)
