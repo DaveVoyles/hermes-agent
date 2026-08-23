@@ -32,6 +32,15 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   response     -- agent response text (truncated to 500 chars)
   model        -- model name that handled the turn
   provider     -- provider that handled the turn
+  input_tokens -- cumulative input tokens observed by the turn's agent
+  output_tokens -- cumulative output tokens observed by the turn's agent
+  total_tokens -- provider-reported cumulative total tokens
+  turn_input_tokens -- input-token delta for this completed turn
+  turn_output_tokens -- output-token delta for this completed turn
+  turn_total_tokens -- provider-reported total-token delta for this turn
+  token_delta_reliable -- whether the turn deltas came from monotonic counters
+  turn_seconds -- wall-clock duration of the completed turn
+  turn_id      -- inbound platform message id when available
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

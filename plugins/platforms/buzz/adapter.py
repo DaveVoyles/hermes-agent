@@ -37,6 +37,7 @@ environment and is never logged.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -99,6 +100,8 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+_MAX_INBOUND_MEDIA_BYTES = 25_000_000
+_MEDIA_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -110,6 +113,43 @@ _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
+
+
+def _event_media_segments(event: dict) -> List[Tuple[str, str]]:
+    """Return verified ``(sha256.ext, sha256)`` pairs from imeta tags."""
+    attachments: List[Tuple[str, str]] = []
+    tags = event.get("tags")
+    if not isinstance(tags, list):
+        return attachments
+    for tag in tags:
+        if not isinstance(tag, list) or not tag or tag[0] != "imeta":
+            continue
+        fields = {}
+        for value in tag[1:]:
+            if not isinstance(value, str) or " " not in value:
+                continue
+            name, content = value.split(" ", 1)
+            fields[name] = content
+        digest = fields.get("x", "").lower()
+        media_type = fields.get("m", "")
+        url = fields.get("url", "")
+        try:
+            size = int(fields.get("size", "0"))
+        except ValueError:
+            continue
+        if (
+            not _MEDIA_HASH_RE.fullmatch(digest)
+            or not media_type.startswith(("image/", "audio/", "video/"))
+            or not (0 < size <= _MAX_INBOUND_MEDIA_BYTES)
+        ):
+            continue
+        name = Path(urlsplit(url).path).name
+        if not name.startswith(f"{digest}.") or not re.fullmatch(
+            rf"{digest}\.[A-Za-z0-9]{{1,10}}", name
+        ):
+            continue
+        attachments.append((name, digest))
+    return attachments
 
 
 def _load_nostr_auth():
@@ -1005,6 +1045,58 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._handle_event(channel_id, state, event)
         self._trim_seen(state)
 
+    async def _download_event_media(self, event: dict) -> List[str]:
+        """Materialize authenticated Blossom attachments for gateway vision."""
+        media_root = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / "media/buzz"
+        media_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(media_root, 0o700)
+        downloaded: List[str] = []
+        for segment, expected_digest in _event_media_segments(event):
+            target = media_root / segment
+            if target.exists():
+                if target.is_symlink() or not target.is_file():
+                    logger.warning("Buzz: refusing unsafe cached media path %s", target)
+                    continue
+                if (
+                    target.stat().st_size > _MAX_INBOUND_MEDIA_BYTES
+                    or hashlib.sha256(target.read_bytes()).hexdigest() != expected_digest
+                ):
+                    logger.warning("Buzz: cached media failed integrity validation")
+                    continue
+                downloaded.append(str(target))
+                continue
+            temporary = media_root / f".{segment}.{os.getpid()}.{time.time_ns()}.tmp"
+            try:
+                code, _out, err = await self._run_cli(
+                    ["media", "get", segment, "--output", str(temporary)]
+                )
+                if code != 0:
+                    logger.warning(
+                        "Buzz: media download failed for %s — %s",
+                        segment,
+                        _cli_error_message(err, code),
+                    )
+                    continue
+                if temporary.is_symlink() or not temporary.is_file():
+                    logger.warning("Buzz: media download produced an unsafe path")
+                    continue
+                if temporary.stat().st_size > _MAX_INBOUND_MEDIA_BYTES:
+                    logger.warning("Buzz: downloaded media exceeded the size limit")
+                    continue
+                digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+                if digest != expected_digest:
+                    logger.warning("Buzz: downloaded media hash did not match imeta")
+                    continue
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, target)
+                downloaded.append(str(target))
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+        return downloaded
+
     async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
         event_id = str(event.get("id") or "")
@@ -1030,6 +1122,21 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
+        tags = event.get("tags")
+        agent_authored = isinstance(tags, list) and any(
+            isinstance(tag, list) and bool(tag) and tag[0] == "auth"
+            for tag in tags
+        )
+        # NIP-OA-authenticated fleet agents may hand work to us, but only by
+        # addressing us explicitly.  This prevents lifecycle notices and
+        # ordinary bot chatter from creating reply loops when owner messages
+        # are allowed without a mention in the home channel.
+        if (
+            not is_dm
+            and agent_authored
+            and not self._is_mentioned(content)
+        ):
+            return
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
@@ -1047,6 +1154,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        media_urls = await self._download_event_media(event)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1056,6 +1164,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            media_urls=media_urls or None,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────

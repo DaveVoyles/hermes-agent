@@ -1,7 +1,9 @@
 """Tests for the Buzz platform adapter plugin."""
 
 import asyncio
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +26,7 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+_event_media_segments = _buzz_mod._event_media_segments
 
 # Real key pair (Chip's public identity — public information, not a secret)
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
@@ -242,6 +245,70 @@ class TestMentionGating:
     async def test_name_mention_dispatched(self, adapter):
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_agent_authored_message_ignored_when_mentions_optional(self, adapter):
+        adapter.require_mention = False
+        event = _event("e1", content="gateway status update", created_at=10)
+        event["tags"].append(["auth", "b" * 64, "", "c" * 128])
+        await self._poll_with(adapter, event)
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_mentioned_agent_authored_message_dispatched_when_mentions_optional(self, adapter):
+        adapter.require_mention = False
+        event = _event("e1", content="@Chip please take over", created_at=10)
+        event["tags"].append(["auth", "b" * 64, "", "c" * 128])
+        await self._poll_with(adapter, event)
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_owner_message_dispatched_when_mentions_optional(self, adapter):
+        adapter.require_mention = False
+        await self._poll_with(adapter, _event("e1", content="owner broadcast", created_at=10))
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_authenticated_imeta_media_is_downloaded_for_gateway_vision(
+        self, adapter, monkeypatch, tmp_path
+    ):
+        payload = b"small-image-fixture"
+        digest = hashlib.sha256(payload).hexdigest()
+        event = _event("e1", content="@Chip inspect this", created_at=10)
+        event["tags"].append(
+            [
+                "imeta",
+                f"url http://localhost:3000/media/{digest}.png",
+                "m image/png",
+                f"x {digest}",
+                f"size {len(payload)}",
+            ]
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        async def media_cli(args, **_kwargs):
+            if args[:2] == ["users", "get"]:
+                return 0, json.dumps({"name": "Owner"}), ""
+            assert args[:3] == ["media", "get", f"{digest}.png"]
+            Path(args[args.index("--output") + 1]).write_bytes(payload)
+            return 0, "", ""
+
+        adapter._run_cli = media_cli
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+        assert len(adapter._dispatched) == 1
+        media_urls = adapter._dispatched[0]["media_urls"]
+        assert len(media_urls) == 1
+        assert Path(media_urls[0]).read_bytes() == payload
+        assert Path(media_urls[0]).stat().st_mode & 0o777 == 0o600
+
+    def test_imeta_parser_rejects_untrusted_hash_size_and_type(self):
+        event = _event("e1")
+        event["tags"] = [
+            ["imeta", "url http://localhost:3000/media/nope.png", "m image/png", "x nope", "size 4"],
+            ["imeta", f"url http://localhost:3000/media/{'a' * 64}.txt", "m text/plain", f"x {'a' * 64}", "size 4"],
+            ["imeta", f"url http://localhost:3000/media/{'b' * 64}.png", "m image/png", f"x {'b' * 64}", "size 999999999"],
+        ]
+        assert _event_media_segments(event) == []
 
 
     @pytest.mark.asyncio

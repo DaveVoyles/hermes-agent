@@ -6325,7 +6325,35 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            _usage_before_input = int(getattr(agent, "session_input_tokens", 0) or 0)
+            _usage_before_output = int(getattr(agent, "session_output_tokens", 0) or 0)
+            _usage_before_total = int(getattr(agent, "session_total_tokens", 0) or 0)
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if isinstance(result, dict):
+                _usage_after_input = int(getattr(agent, "session_input_tokens", 0) or 0)
+                _usage_after_output = int(getattr(agent, "session_output_tokens", 0) or 0)
+                _usage_after_total = int(getattr(agent, "session_total_tokens", 0) or 0)
+                _usage_delta_reliable = (
+                    _usage_after_input >= _usage_before_input
+                    and _usage_after_output >= _usage_before_output
+                    and _usage_after_total >= _usage_before_total
+                )
+                result["_gateway_turn_input_tokens"] = (
+                    _usage_after_input - _usage_before_input
+                    if _usage_delta_reliable
+                    else _usage_after_input
+                )
+                result["_gateway_turn_output_tokens"] = (
+                    _usage_after_output - _usage_before_output
+                    if _usage_delta_reliable
+                    else _usage_after_output
+                )
+                result["_gateway_turn_total_tokens"] = (
+                    _usage_after_total - _usage_before_total
+                    if _usage_delta_reliable
+                    else _usage_after_total
+                )
+                result["_gateway_token_delta_reliable"] = _usage_delta_reliable
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -6389,12 +6417,14 @@ class TurnRunner:
         _last_prompt_toks = 0
         _input_toks = 0
         _output_toks = 0
+        _total_toks = 0
         _context_length = 0
         _agent = ctx.agent_holder[0]
         if _agent and hasattr(_agent, "context_compressor"):
             _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-            _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-            _output_toks = getattr(_agent, "session_completion_tokens", 0)
+            _input_toks = getattr(_agent, "session_input_tokens", 0)
+            _output_toks = getattr(_agent, "session_output_tokens", 0)
+            _total_toks = getattr(_agent, "session_total_tokens", 0)
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
 
@@ -6531,6 +6561,13 @@ class TurnRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "total_tokens": _total_toks,
+                "turn_input_tokens": result.get("_gateway_turn_input_tokens", 0),
+                "turn_output_tokens": result.get("_gateway_turn_output_tokens", 0),
+                "turn_total_tokens": result.get("_gateway_turn_total_tokens", 0),
+                "token_delta_reliable": result.get(
+                    "_gateway_token_delta_reliable", False
+                ),
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
@@ -6612,6 +6649,13 @@ class TurnRunner:
             "last_prompt_tokens": _last_prompt_toks,
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
+            "total_tokens": _total_toks,
+            "turn_input_tokens": result.get("_gateway_turn_input_tokens", 0),
+            "turn_output_tokens": result.get("_gateway_turn_output_tokens", 0),
+            "turn_total_tokens": result.get("_gateway_turn_total_tokens", 0),
+            "token_delta_reliable": result.get(
+                "_gateway_token_delta_reliable", False
+            ),
             "model": _resolved_model,
             "context_length": _context_length,
             "session_id": effective_session_id,
@@ -20285,11 +20329,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
+            _input_tokens = int(agent_result.get("input_tokens") or 0)
+            _output_tokens = int(agent_result.get("output_tokens") or 0)
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
                 "model": agent_result.get("model", ""),
                 "provider": agent_result.get("provider", ""),
+                "input_tokens": _input_tokens,
+                "output_tokens": _output_tokens,
+                "total_tokens": int(agent_result.get("total_tokens") or 0),
+                "turn_input_tokens": int(
+                    agent_result.get("turn_input_tokens") or 0
+                ),
+                "turn_output_tokens": int(
+                    agent_result.get("turn_output_tokens") or 0
+                ),
+                "turn_total_tokens": int(
+                    agent_result.get("turn_total_tokens") or 0
+                ),
+                "token_delta_reliable": bool(
+                    agent_result.get("token_delta_reliable", False)
+                ),
+                "turn_seconds": _turn_seconds,
+                "session_id": agent_result.get("session_id") or _run_start_session_id,
+                "turn_id": (
+                    self._reply_anchor_for_event(event)
+                    or getattr(event, "message_id", None)
+                    or ""
+                ),
             })
             
             # Check for pending process watchers (check_interval on background processes)

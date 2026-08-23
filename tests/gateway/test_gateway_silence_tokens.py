@@ -182,6 +182,14 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
         "failed": False,
         "model": "gpt-5.6-terra",
         "provider": "openai-codex",
+        "input_tokens": 123,
+        "output_tokens": 45,
+        "total_tokens": 170,
+        "turn_input_tokens": 23,
+        "turn_output_tokens": 5,
+        "turn_total_tokens": 30,
+        "token_delta_reliable": True,
+        "session_id": "sess-silent",
     })
 
     await runner._handle_message_with_agent(
@@ -195,3 +203,12 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
     )
     assert end_context["model"] == "gpt-5.6-terra"
     assert end_context["provider"] == "openai-codex"
+    assert end_context["input_tokens"] == 123
+    assert end_context["output_tokens"] == 45
+    assert end_context["total_tokens"] == 170
+    assert end_context["turn_input_tokens"] == 23
+    assert end_context["turn_output_tokens"] == 5
+    assert end_context["turn_total_tokens"] == 30
+    assert end_context["token_delta_reliable"] is True
+    assert end_context["session_id"] == "sess-silent"
+    assert end_context["turn_id"] == "msg-42"
