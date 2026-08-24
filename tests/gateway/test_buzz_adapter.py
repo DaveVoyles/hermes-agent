@@ -498,6 +498,24 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_stays_in_channel_when_gateway_passes_thread_id(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-flat", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "channel top",
+            reply_to="inbound-event-id",
+            metadata={"thread_id": "inbound-event-id"},
+        )
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
@@ -511,6 +529,22 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_send_image_ignores_reply_to(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+        result = await adapter.send_image(
+            CHANNEL, str(img), caption="screenshot", reply_to="inbound-event-id"
+        )
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -621,10 +655,16 @@ class TestStandaloneSend:
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
 
-        result = await _standalone_send(PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi")
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            CHANNEL,
+            "cron says hi",
+            thread_id="inbound-event-id",
+        )
         assert result == {"success": True, "message_id": "evt-cron"}
         assert captured["args"][:2] == ["messages", "send"]
         assert captured["input_text"] == "cron says hi"
+        assert "--reply-to" not in captured["args"]
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
 

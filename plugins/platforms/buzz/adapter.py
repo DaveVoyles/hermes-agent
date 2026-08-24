@@ -649,9 +649,9 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
-        if reply_target:
-            args += ["--reply-to", str(reply_target)]
+        # Never --reply-to. Hermes maps inbound message_id onto metadata.thread_id
+        # (Slack-style). On Buzz that nests every turn under the user's message.
+        _ = (reply_to, metadata)
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -721,8 +721,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            _ = reply_to
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1498,8 +1497,7 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    if thread_id:
-        args += ["--reply-to", str(thread_id)]
+    _ = thread_id
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
